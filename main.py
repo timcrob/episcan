@@ -21,6 +21,8 @@ try:
     from subliminal import download_best_subtitles, save_subtitles
     from subliminal.video import Episode
     from subliminal.core import provider_manager
+    from subliminal.cache import region as subliminal_region
+    subliminal_region.configure('dogpile.cache.memory')
     SUBLIMINAL_AVAILABLE = True
 except ImportError:
     SUBLIMINAL_AVAILABLE = False
@@ -581,10 +583,6 @@ def get_subliminal_episode_subtitles(show_info, episodes_data, verbose=False, no
         # Not in cache, download with subliminal
         if verbose:
             print(f"    No cache found, downloading...")
-            
-        # Not in cache, download with subliminal
-        if verbose:
-            print(f"    No cache found, downloading...")
         
         # Create temporary directory for video simulation  
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -601,92 +599,56 @@ def get_subliminal_episode_subtitles(show_info, episodes_data, verbose=False, no
                     name=str(fake_video_path),
                     series=show_info['show'],
                     season=show_info['season'],
-                    episodes=[episode['number']]  # Pass as list of episode numbers
+                    episodes=[episode['number']]
                 )
                 
-                # Try different provider strategies to increase success rate
-                # Let subliminal manage available providers instead of hardcoding lists
+                # Use OpenSubtitles VIP provider directly
+                subtitles = {}
+                best_subtitle = None
                 try:
-                    # Get all available providers from subliminal
-                    all_providers = list(provider_manager.names())
-                    reliable_providers = ['opensubtitles', 'podnapisi', 'addic7ed'] 
-                    # Filter reliable providers to only those actually available
-                    reliable_providers = [p for p in reliable_providers if p in all_providers]
-                except Exception:
-                    # Fallback if provider discovery fails
-                    all_providers = None
-                    reliable_providers = ['opensubtitles', 'podnapisi']
-                
-                provider_strategies = [
-                    # First try: Just the most reliable providers
-                    reliable_providers,
-                    # Second try: All available providers (let subliminal decide)
-                    all_providers,  
-                    # Last try: OpenSubtitles only
-                    ['opensubtitles']
-                ]
-                
-                subtitles = None
-                for providers in provider_strategies:
-                    # Skip None strategies (in case provider discovery failed)
-                    if providers is None:
-                        continue
-                        
-                    try:
-                        if verbose:
-                            if providers == all_providers:
-                                print(f"    Trying all available providers ({len(providers) if providers else 0} total)")
-                            else:
-                                print(f"    Trying providers: {', '.join(providers)}")
-                        
-                        # Download best subtitles (tries multiple providers automatically)
-                        subtitles = download_best_subtitles(
-                            [video], 
-                            languages={'en'},
-                            providers=providers,
-                            provider_configs={
-                                'opensubtitles': {
-                                    'username': os.getenv('OPENSUBTITLES_USERNAME', ''), 
-                                    'password': os.getenv('OPENSUBTITLES_PASSWORD', '')
-                                },
-                                'addic7ed': {
-                                    'username': os.getenv('ADDIC7ED_USERNAME', ''),
-                                    'password': os.getenv('ADDIC7ED_PASSWORD', '')
-                                }
-                            }
+                    from subliminal.providers.opensubtitlescom import OpenSubtitlesComVipProvider
+                    from babelfish import Language
+                    if verbose:
+                        print(f"    Trying opensubtitlescomvip...")
+                    provider = OpenSubtitlesComVipProvider(
+                        username=os.getenv('OPENSUBTITLES_USERNAME', ''),
+                        password=os.getenv('OPENSUBTITLES_PASSWORD', ''),
+                        apikey=os.getenv('OPENSUBTITLES_API_KEY', '')
+                    )
+                    provider.user_agent = 'episcan v1.0'
+                    with provider:
+                        results = provider.query(
+                            {Language('eng')},
+                            query=show_info['show'],
+                            season=show_info['season'],
+                            episode=episode['number']
                         )
-                        
-                        # If we got subtitles, break out of the retry loop
-                        if video in subtitles and subtitles[video]:
-                            break
-                            
-                    except Exception as provider_error:
-                        if verbose:
-                            strategy_desc = "all providers" if providers == all_providers else f"providers {providers}"
-                            print(f"    Strategy '{strategy_desc}' failed: {provider_error}")
-                        # Small delay after failed provider attempts to avoid hammering
-                        time.sleep(0.3)
-                        continue
+                        if results:
+                            best_subtitle = max(results, key=lambda s: getattr(s, 'score', 0))
+                            provider.download_subtitle(best_subtitle)
+                            subtitles = {video: [best_subtitle]}
+                            if verbose:
+                                print(f"    Found and downloaded subtitle")
+                        else:
+                            if verbose:
+                                print(f"    ✗ No subtitles found")
+                except Exception as provider_error:
+                    if verbose:
+                        print(f"    Provider failed: {provider_error}")
                 
                 if subtitles and video in subtitles and subtitles[video]:
-                    # Get the best subtitle
-                    best_subtitle = max(subtitles[video], key=lambda s: getattr(s, 'score', 0))
-                    
                     try:
                         subtitle_text = best_subtitle.content.decode('utf-8') if best_subtitle.content else ''
                     except UnicodeDecodeError:
-                        # Try different encodings
                         try:
                             subtitle_text = best_subtitle.content.decode('latin-1') if best_subtitle.content else ''
                         except:
                             subtitle_text = ''
                     
                     if subtitle_text:
-                        # Parse subtitle content to extract text
                         clean_text = parse_subtitle_content(subtitle_text)
                         
                         if clean_text:
-                            # Save to cache (unless disabled)
                             if not no_cache:
                                 save_subtitle_to_cache(
                                     show_info['show'], 
@@ -699,24 +661,21 @@ def get_subliminal_episode_subtitles(show_info, episodes_data, verbose=False, no
                             
                             episode_with_subtitles = episode.copy()
                             episode_with_subtitles['subtitle_text'] = clean_text
-                            episode_with_subtitles['subtitle_content'] = subtitle_text  # Store raw content for time extraction
+                            episode_with_subtitles['subtitle_content'] = subtitle_text
                             subtitles_data.append(episode_with_subtitles)
                             downloads += 1
                             
                             if verbose:
                                 print(f"    ✓ Downloaded and cached subtitles ({len(clean_text)} chars) from {best_subtitle.provider_name}")
                         else:
-                            # Failed to extract text, use description
                             subtitles_data.append(episode)
                             if verbose:
                                 print(f"    ✗ Failed to extract text from subtitle")
                     else:
-                        # No content, use description
                         subtitles_data.append(episode)
                         if verbose:
                             print(f"    ✗ Empty subtitle content")
                 else:
-                    # No subtitles found, use description
                     subtitles_data.append(episode)
                     if verbose:
                         print(f"    ✗ No subtitles found from any provider")
